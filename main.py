@@ -131,6 +131,14 @@ else:
         "http://127.0.0.1:5175",
     ]
 
+# Add Railway domain to allowed origins if available
+railway_public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+if railway_public_domain:
+    railway_url = f"https://{railway_public_domain}"
+    if railway_url not in ALLOWED_ORIGINS:
+        ALLOWED_ORIGINS.append(railway_url)
+        logger.info(f"Added Railway domain to CORS: {railway_url}")
+
 # In development, be more permissive - allow any localhost origin
 if os.getenv("ENVIRONMENT", "development").lower() == "development":
     # Use regex to allow any localhost port for development
@@ -5180,4 +5188,6 @@ async def get_system_logs(lines: int = 100):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
