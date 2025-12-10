@@ -1,0 +1,158 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+*.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# MongoDB
+*.log
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Test Results & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+test_results/
+agent_test_results.json
+
+# Vector Stores & Embeddings
+chroma_db/
+*.chroma
+vector_store/
+embeddings_cache/
+*.index
+
+# Excel Files & Uploads
+uploads/
+temp/
+tmp/
+*.xlsx
+*.xls
+*.csv
+!visualizations/**/*.csv  # Keep visualization CSVs
+
+# Generated Files
+*.pyc
+*.pyo
+*.pyd
+.cache/
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Visualizations (generated files)
+visualizations/**/*.png
+visualizations/**/*.json
+visualizations/**/*.csv
+visualizations/**/*.txt
+!visualizations/SYSTEM_REPORT.md  # Keep the report markdown
+
+# Results & Reports (generated)
+results/
+*.json
+!package.json  # If you have one
+!tsconfig.json  # If you have one
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# API Keys & Secrets
+secrets/
+*.pem
+*.key
+*.cert
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Node modules (if any frontend tools)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# MacOS
+.AppleDouble
+.LSOverride
+
+# Windows
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+

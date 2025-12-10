@@ -1,0 +1,33 @@
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# Excel Parser Dependencies (Phase 1)
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-dateutil>=2.8.0
+chardet>=5.0.0
+
+# Phase 2: Schema Detection & Gemini Integration
+google-generativeai>=0.3.0
+
+# Phase 3: Semantic Indexing & RAG
+sentence-transformers>=2.2.0
+chromadb>=0.4.0
+numpy>=1.24.0
+
+# Phase 4: LangChain Agent System
+langchain>=0.1.0
+langchain-community>=0.0.20
+langchain-groq>=0.1.0
+langchain-google-genai>=1.0.0
+groq>=0.4.0
+
+# Multi-Tenant SaaS: Authentication & MongoDB
+python-jose[cryptography]>=3.3.0  # JWT tokens
+passlib[bcrypt]>=1.7.4              # Password hashing
+motor>=3.3.0                         # Async MongoDB driver
+pymongo>=4.6.0                       # MongoDB driver
+
