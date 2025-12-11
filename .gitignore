@@ -107,12 +107,9 @@ Thumbs.db
 *.swo
 *~
 
-# Visualizations (generated files)
-visualizations/**/*.png
-visualizations/**/*.json
-visualizations/**/*.csv
-visualizations/**/*.txt
-!visualizations/SYSTEM_REPORT.md  # Keep the report markdown
+# Visualizations (generated files) - exclude entire directory
+visualizations/
+!visualizations/.gitkeep
 
 # Results & Reports (generated)
 results/
@@ -133,8 +130,8 @@ secrets/
 *.cert
 
 # Docker
-.dockerignore
 docker-compose.override.yml
+# Note: .dockerignore should be committed
 
 # Node modules (if any frontend tools)
 node_modules/

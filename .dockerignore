@@ -1,8 +1,26 @@
-# Environment
-.env
-.env.local
-.env.*.local
-*.env
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
 # Virtual Environments
 venv/
@@ -11,20 +29,6 @@ ENV/
 env.bak/
 venv.bak/
 .venv/
-
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-*.egg
 
 # Large data files and visualizations
 visualizations/
@@ -37,6 +41,7 @@ agent_test_results.json
 
 # Test files
 tests/
+*.pyc
 .pytest_cache/
 .coverage
 htmlcov/
@@ -72,20 +77,27 @@ Thumbs.db
 .gitignore
 .gitattributes
 
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.env
+
 # Logs
 logs/
 *.log
 *.log.*
 
-# Cache directories (models downloaded at runtime)
+# Cache directories (models will be downloaded at runtime)
 .cache/
 ~/.cache/
+.cache/
 *.cache
 .cache_huggingface/
 .cache_torch/
 .cache_sentence_transformers/
 
-# Model files (downloaded at runtime)
+# Model files (will be downloaded at runtime)
 *.bin
 *.pt
 *.pth
@@ -95,7 +107,7 @@ logs/
 models/
 checkpoints/
 
-# Vector stores (created at runtime)
+# Vector stores (will be created at runtime)
 chroma_db/
 *.chroma
 vector_store/
@@ -115,7 +127,7 @@ temp/
 *.sqlite
 *.sqlite3
 
-# Excel files (user uploads)
+# Excel files (user uploads, not needed in image)
 uploads/
 *.xlsx
 *.xls
@@ -124,7 +136,7 @@ uploads/
 results/
 reports/
 
-# Node modules
+# Node modules (if any)
 node_modules/
 npm-debug.log*
 yarn-debug.log*
