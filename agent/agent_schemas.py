@@ -24,7 +24,7 @@ class AgentQueryRequest(BaseModel):
     file_id: Optional[str] = Field(None, description="Specific file ID to query (optional)")
     provider: str = Field("gemini", description="LLM provider: 'gemini' or 'groq'")
     include_provenance: bool = Field(True, description="Include provenance in response")
-    max_iterations: int = Field(10, ge=1, le=25, description="Maximum agent iterations")
+    max_iterations: int = Field(25, ge=1, le=50, description="Maximum agent iterations")
     conversation_id: Optional[str] = Field(None, description="Conversation ID for multi-turn context")
     date_range: Optional[Dict[str, Optional[str]]] = Field(None, description="Date range filter: {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD'}")
 

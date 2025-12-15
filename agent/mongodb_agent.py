@@ -45,19 +45,18 @@ def create_tool_wrappers(user_id: str, file_id: Optional[str] = None) -> List[To
     """
     
     def wrap_table_loader(query: str) -> str:
-        """Load table sample and schema. Use format: file_id|table_name|filters_json|fields_json|limit"""
+        """Load table sample and schema. Use format: file_id|table_name|file_name_pattern|filters_json|fields_json|limit
+        file_id can be "*" for all files, table_name can be "*" for all sheets, file_name_pattern for filename search"""
         try:
             parts = query.split("|")
-            file_id_param = parts[0].strip() if len(parts) > 0 and parts[0].strip() else file_id
-            table_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "Sheet1"
-            filters = json.loads(parts[2]) if len(parts) > 2 and parts[2].strip() else None
-            fields = json.loads(parts[3]) if len(parts) > 3 and parts[3].strip() else None
-            limit = int(parts[4]) if len(parts) > 4 and parts[4].strip() else 100
+            file_id_param = parts[0].strip() if len(parts) > 0 and parts[0].strip() else (file_id or "*")
+            table_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "*"
+            file_name_pattern = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+            filters = json.loads(parts[3]) if len(parts) > 3 and parts[3].strip() else None
+            fields = json.loads(parts[4]) if len(parts) > 4 and parts[4].strip() else None
+            limit = int(parts[5]) if len(parts) > 5 and parts[5].strip() else 100
             
-            if not file_id_param:
-                return json.dumps({"ok": False, "error": "file_id required"})
-            
-            result = table_loader(user_id, file_id_param, table_name, filters, fields, limit)
+            result = table_loader(user_id, file_id_param, table_name, file_name_pattern, filters, fields, limit)
             return json.dumps(result, default=str)
         except json.JSONDecodeError as e:
             return json.dumps({"ok": False, "error": f"JSON decode error: {str(e)}"})
@@ -69,20 +68,23 @@ def create_tool_wrappers(user_id: str, file_id: Optional[str] = None) -> List[To
             return json.dumps({"ok": False, "error": str(e)})
     
     def wrap_agg_helper(query: str) -> str:
-        """Run aggregations. Use format: file_id|table_name|filters_json|metrics_json"""
+        """Run aggregations. Use format: file_id|table_name|file_name_pattern|filters_json|metrics_json|date_filter_json|group_by_source
+        file_id can be "*" for all files, table_name can be "*" for all sheets"""
         try:
             parts = query.split("|")
-            file_id_param = parts[0] if len(parts) > 0 else file_id
-            table_name = parts[1] if len(parts) > 1 else "Sheet1"
-            filters = json.loads(parts[2]) if len(parts) > 2 and parts[2] else None
-            metrics = json.loads(parts[3]) if len(parts) > 3 else []
+            file_id_param = parts[0].strip() if len(parts) > 0 and parts[0].strip() else (file_id or "*")
+            table_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "*"
+            file_name_pattern = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+            filters = json.loads(parts[3]) if len(parts) > 3 and parts[3].strip() else None
+            metrics = json.loads(parts[4]) if len(parts) > 4 and parts[4].strip() else []
+            date_filter = json.loads(parts[5]) if len(parts) > 5 and parts[5].strip() else None
+            group_by_source = parts[6].lower() == "true" if len(parts) > 6 and parts[6].strip() else False
             
-            if not file_id_param:
-                return json.dumps({"error": "file_id required"})
-            
-            result = agg_helper(user_id, file_id_param, table_name, filters, metrics)
+            result = agg_helper(user_id, file_id_param, table_name, file_name_pattern, filters, metrics, date_filter, True, group_by_source)
             return json.dumps(result, default=str)
         except Exception as e:
+            import traceback
+            logger.error(f"Error in wrap_agg_helper: {str(e)}\n{traceback.format_exc()}")
             return json.dumps({"ok": False, "error": str(e)})
     
     def wrap_timeseries_analyzer(query: str) -> str:
@@ -198,6 +200,59 @@ def create_tool_wrappers(user_id: str, file_id: Optional[str] = None) -> List[To
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)})
     
+    def wrap_detect_date_columns(query: str) -> str:
+        """Detect date columns across files/sheets. Use format: file_id|table_name|file_name_pattern"""
+        try:
+            parts = query.split("|")
+            file_id_param = parts[0].strip() if len(parts) > 0 and parts[0].strip() else (file_id or "*")
+            table_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "*"
+            file_name_pattern = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+            
+            from tools.mongodb_tools import detect_date_columns
+            result = detect_date_columns(user_id, file_id_param, table_name, file_name_pattern)
+            return json.dumps(result, default=str)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+    
+    def wrap_extract_dates_from_filenames(query: str) -> str:
+        """Extract dates from file names. Use format: file_name_pattern"""
+        try:
+            file_name_pattern = query.strip() if query.strip() else None
+            
+            from tools.mongodb_tools import extract_dates_from_filenames
+            result = extract_dates_from_filenames(user_id, file_name_pattern)
+            return json.dumps(result, default=str)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+    
+    def wrap_parse_relative_date(query: str) -> str:
+        """Parse relative date expressions. Use format: date_expression"""
+        try:
+            from tools.mongodb_tools import parse_relative_date
+            result = parse_relative_date(query.strip())
+            return json.dumps(result, default=str)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+    
+    def wrap_search_across_all_files(query: str) -> str:
+        """Search for a column across all files and sheets. Use format: column_name|search_value|file_name_pattern|table_name_pattern|limit"""
+        try:
+            parts = query.split("|")
+            column_name = parts[0].strip() if len(parts) > 0 and parts[0].strip() else None
+            search_value = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+            file_name_pattern = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+            table_name_pattern = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
+            limit = int(parts[4]) if len(parts) > 4 and parts[4].strip() else 100
+            
+            if not column_name:
+                return json.dumps({"ok": False, "error": "column_name required"})
+            
+            from tools.mongodb_tools import search_across_all_files
+            result = search_across_all_files(user_id, column_name, search_value, file_name_pattern, table_name_pattern, limit)
+            return json.dumps(result, default=str)
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+    
     tools = [
         Tool(
             name="list_user_files",
@@ -211,15 +266,20 @@ def create_tool_wrappers(user_id: str, file_id: Optional[str] = None) -> List[To
             name="table_loader",
             func=wrap_table_loader,
             description=f"""Load table sample and schema from MongoDB. 
-            Input format: file_id|table_name|filters_json|fields_json|limit
-            {"Default file_id: " + file_id if file_id else "file_id is REQUIRED - get it from question context"}
-            Returns: schema, sample_rows, row_count. Always call this first to inspect available columns."""
+            Input format: file_id|table_name|file_name_pattern|filters_json|fields_json|limit
+            file_id can be "*" for all files, table_name can be "*" for all sheets
+            file_name_pattern: search files by name (e.g., "July 25")
+            {"Default file_id: " + file_id if file_id else "file_id can be '*' for all files"}
+            Returns: schema, sample_rows, row_count, schemas_by_source. Always call this first to inspect available columns."""
         ),
         Tool(
             name="agg_helper",
             func=wrap_agg_helper,
             description="""Run deterministic aggregations (sum, avg, count, min, max, median).
-            Input format: file_id|table_name|filters_json|metrics_json
+            Input format: file_id|table_name|file_name_pattern|filters_json|metrics_json|date_filter_json|group_by_source
+            file_id can be "*" for all files, table_name can be "*" for all sheets
+            date_filter_json: {"column": "date_col", "start": "2025-01-01", "end": "2025-12-31", "auto_detect": true}
+            group_by_source: "true" to aggregate separately per file/sheet
             metrics_json format: [{"op":"sum","col":"column_name","alias":"result_name"}]
             Returns: aggregated values as Decimal for accuracy.
             USE THIS FOR: Questions asking "What is the mean/average/total/sum/count/min/max/median of X?"
@@ -279,6 +339,37 @@ def create_tool_wrappers(user_id: str, file_id: Optional[str] = None) -> List[To
             description="""Get date range information for a time column (min date, max date, row count, span in days).
             Input format: file_id|table_name|time_col
             Returns: min_date, max_date, row_count, span_days. Use to check if data is too large before analyzing."""
+        ),
+        Tool(
+            name="detect_date_columns",
+            func=wrap_detect_date_columns,
+            description="""Auto-detect all columns containing date values across files/sheets.
+            Input format: file_id|table_name|file_name_pattern
+            file_id can be "*" for all files, table_name can be "*" for all sheets
+            Returns: date_columns_by_source with confidence, min_date, max_date for each column.
+            ALWAYS call this FIRST when question involves dates to find which columns contain dates."""
+        ),
+        Tool(
+            name="extract_dates_from_filenames",
+            func=wrap_extract_dates_from_filenames,
+            description="""Extract date information from file names.
+            Input format: file_name_pattern (e.g., "July 25", "2025-07-25", "Q1 2025")
+            Returns: files_with_dates containing extracted dates from filenames.
+            Use when user mentions a file name that might contain a date."""
+        ),
+        Tool(
+            name="parse_relative_date",
+            func=wrap_parse_relative_date,
+            description="""Parse relative date expressions and convert to absolute dates.
+            Input format: date_expression (e.g., "last month", "this week", "last 30 days", "Q1 2025")
+            Returns: start_date, end_date, type. Use to convert relative dates to absolute date ranges."""
+        ),
+        Tool(
+            name="search_across_all_files",
+            func=wrap_search_across_all_files,
+            description="""Search for a column across ALL files and sheets.
+            Input format: column_name|search_value|file_name_pattern|table_name_pattern|limit
+            Returns: results_by_source grouped by file/sheet. Use when user asks to find something across all files."""
         )
     ]
     
@@ -290,7 +381,54 @@ def create_agent_prompt() -> PromptTemplate:
     
     prompt = """You are an expert data analyst assistant. Your role is to answer questions about data stored in MongoDB using ONLY the provided tools.
 
-CRITICAL RULES:
+CRITICAL RULES FOR MULTI-FILE/MULTI-SHEET SEARCHES:
+
+1. SEARCH SCOPE:
+   - Use file_id="*" or table_name="*" to search ALL files/sheets
+   - Use file_name_pattern="July 25" to search files by name
+   - Default: searches single file/sheet (backward compatible)
+
+2. WHEN TO SEARCH ALL FILES/SHEETS:
+   - User mentions "all files", "all workbooks", "across files"
+   - User mentions specific file name (e.g., "July 25")
+   - User asks about data that might be in multiple sheets
+   - Question doesn't specify a file/sheet
+
+3. FILE NAME REFERENCES:
+   - If user mentions a file name (e.g., "July 25"), use file_name_pattern="July 25"
+   - First call list_user_files to see available files and their exact names
+   - Match file names case-insensitively
+
+4. HANDLING SAME SHEET/COLUMN NAMES:
+   - When searching across files, results include file_id and file_name
+   - When searching across sheets, results include table_name
+   - Use group_by_source=True in agg_helper to get per-file/sheet breakdowns
+
+CRITICAL RULES FOR DATE QUERIES:
+
+1. DATE COLUMN DETECTION:
+   - ALWAYS call detect_date_columns FIRST when question involves dates
+   - Dates can be in ANY column (not just "date" or "time")
+   - Use detect_date_columns(user_id, file_id="*", table_name="*") to find all date columns
+
+2. DATE FROM FILE NAMES:
+   - If user mentions file name with date (e.g., "July 25"), use extract_dates_from_filenames
+   - File names can contain: "July 25", "2025-07-25", "Q1 2025", etc.
+   - Match files by date extracted from filename
+
+3. RELATIVE DATE EXPRESSIONS:
+   - "last month" → previous month (start to end)
+   - "this week" → current week (Monday to today)
+   - "last 30 days" → 30 days ago to today
+   - "Q1 2025" → January 1 - March 31, 2025
+   - Use parse_relative_date to convert to absolute dates
+
+4. CURRENT DATE RELATIONS:
+   - Always use current date as reference for relative dates
+   - "last month" means previous calendar month
+   - "this week" means current week (Monday-Sunday)
+
+GENERAL CRITICAL RULES:
 1. ALWAYS call table_loader FIRST to inspect schema and available columns
 2. NEVER compute numbers in your text - ALWAYS use agg_helper, timeseries_analyzer, or calc_eval
 3. For time-based questions, use timeseries_analyzer
@@ -301,27 +439,45 @@ CRITICAL RULES:
 
 TOOL USAGE EXAMPLES:
 
-Example 1: "What is the total revenue?"
-- Step 1: table_loader("file123|Sheet1|||100") to see columns
-- Step 2: agg_helper("file123|Sheet1||[{{\"op\":\"sum\",\"col\":\"revenue\",\"alias\":\"total_revenue\"}}]")
-- Step 3: Extract total_revenue from result and present answer
+Example 1: "What is total revenue across all files?"
+- Step 1: agg_helper(user_id, file_id="*", table_name="*", metrics=[{"op":"sum","col":"revenue"}])
 
-Example 2: "Show monthly sales trend"
-- Step 1: table_loader to find date and sales columns
-- Step 2: timeseries_analyzer("file123|Sheet1|date|sales|month|sum||")
-- Step 3: Present series data and trend
+Example 2: "Show revenue from July 25 file"
+- Step 1: agg_helper(user_id, file_name_pattern="July 25", table_name="*", metrics=[{"op":"sum","col":"revenue"}])
 
-Example 3: "Compare Product A vs Product B sales"
-- Step 1: table_loader to find product and sales columns
-- Step 2: compare_entities("file123|Sheet1|product|sales|Product A|Product B|sum|")
-- Step 3: Present comparison with percent difference
+Example 3: "Compare revenue across all sheets in July 25"
+- Step 1: agg_helper(user_id, file_name_pattern="July 25", table_name="*", group_by_source=True, metrics=[{"op":"sum","col":"revenue"}])
 
-Example 4: "What is 15% of total revenue?"
-- Step 1: agg_helper to get total_revenue
-- Step 2: calc_eval("total_revenue * 0.15")
-- Step 3: Present calculated result
+Example 4: "Find all rows with Product='Widget' in all files"
+- Step 1: search_across_all_files(user_id, column_name="Product", search_value="Widget")
+
+Example 5: "What columns exist in July 25 file?"
+- Step 1: table_loader(user_id, file_name_pattern="July 25", table_name="*")
+
+Example 6: "Revenue for last month"
+- Step 1: detect_date_columns(user_id, file_id="*") to find date columns
+- Step 2: parse_relative_date("last month") to get date range
+- Step 3: agg_helper(user_id, file_id="*", date_filter={"start": "2025-06-01", "end": "2025-06-30", "auto_detect": true})
+
+Example 7: "Data from July 25 file"
+- Step 1: extract_dates_from_filenames(user_id, file_name_pattern="July 25")
+- Step 2: Use file_id from result in queries
+
+Example 8: "Compare this week vs last week"
+- Step 1: parse_relative_date("this week") → get date range
+- Step 2: parse_relative_date("last week") → get date range
+- Step 3: Run two separate agg_helper calls with respective date filters
+- Step 4: Compare results
+
+Example 9: "Total sales in last 30 days across all files"
+- Step 1: detect_date_columns(user_id, file_id="*")
+- Step 2: parse_relative_date("last 30 days")
+- Step 3: agg_helper(user_id, file_id="*", table_name="*", date_filter={"start": "...", "end": "...", "auto_detect": true})
 
 RESPONSE FORMAT:
+- When results span multiple files/sheets, clearly indicate source (file_name::table_name)
+- Show breakdown by source when relevant
+- Include provenance showing which files/sheets were searched
 - Provide a clear, concise answer
 - Include numeric values with units if applicable
 - Mention which tools were used
@@ -342,7 +498,7 @@ def create_agent_executor(
     llm: BaseLanguageModel,
     user_id: str,
     file_id: Optional[str] = None,
-    max_iterations: int = 15
+    max_iterations: int = 25
 ) -> AgentExecutor:
     """
     Create LangChain agent executor with MongoDB tools.
@@ -382,17 +538,38 @@ Observation: the result of the action
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
-CRITICAL RULES:
-1. If you don't know which file_id to use, ALWAYS call list_user_files FIRST to see available files
-2. After getting files from list_user_files, pick the most relevant file_id based on the question
-3. ALWAYS call table_loader FIRST to inspect schema (after you have the correct file_id)
-4. NEVER compute numbers yourself - use agg_helper, timeseries_analyzer, statistical_summary, or calc_eval
-5. Include provenance in your answer
-6. If file_id is provided above, use that EXACT file_id - do NOT invent or guess file_ids like "12345" or "1"
-7. Default table_name is "Sheet1" unless specified otherwise
-8. If table_loader returns "no_rows", you're using the wrong file_id - call list_user_files again and try a different file_id
-9. NEVER use placeholder file_ids - always use real file_ids from list_user_files results
-10. For time series questions requesting charts, ensure the response includes chart_config with chart_type, data, and options
+CRITICAL RULES FOR MULTI-FILE/MULTI-SHEET:
+1. SEARCH SCOPE: Use file_id="*" or table_name="*" to search ALL files/sheets
+2. FILE NAME SEARCH: Use file_name_pattern="July 25" when user mentions file names
+3. If you don't know which file_id to use, ALWAYS call list_user_files FIRST to see available files
+4. After getting files from list_user_files, pick the most relevant file_id based on the question
+5. ALWAYS call table_loader FIRST to inspect schema (after you have the correct file_id or "*")
+6. When searching across files/sheets, use group_by_source=True to get per-source breakdowns
+
+EFFICIENCY RULES (IMPORTANT - Follow these to avoid hitting iteration limits):
+1. MINIMIZE ITERATIONS: Answer questions in 3-5 tool calls maximum when possible
+2. COMBINE OPERATIONS: Use agg_helper with date_filter instead of separate detect_date_columns + parse_relative_date + agg_helper calls
+3. DIRECT TOOL SELECTION: Choose the right tool immediately based on question type (see TOOL SELECTION GUIDE below)
+4. AVOID REDUNDANT CALLS: Don't call table_loader multiple times for the same file/sheet
+5. USE WILDCARDS: When question says "all files" or "all sheets", use "*" immediately - don't iterate through each one
+6. STOP EARLY: Once you have the answer, provide Final Answer immediately - don't make additional unnecessary tool calls
+7. BATCH OPERATIONS: When possible, use single agg_helper call with multiple metrics instead of multiple separate calls
+
+CRITICAL RULES FOR DATE QUERIES:
+1. ALWAYS call detect_date_columns FIRST when question involves dates
+2. Use extract_dates_from_filenames when user mentions file names with dates
+3. Use parse_relative_date for expressions like "last month", "this week", "last 30 days"
+4. Apply date filters using date_filter parameter in agg_helper
+5. COMBINE DATE OPERATIONS: When using dates, combine detect_date_columns + parse_relative_date + agg_helper in minimal steps
+
+GENERAL CRITICAL RULES:
+1. NEVER compute numbers yourself - use agg_helper, timeseries_analyzer, statistical_summary, or calc_eval
+2. Include provenance in your answer
+3. If file_id is provided above, use that EXACT file_id - do NOT invent or guess file_ids like "12345" or "1"
+4. Default table_name is "*" (all sheets) unless specified otherwise - use "Sheet1" only if question specifies a single sheet
+5. If table_loader returns "no_rows", you're using the wrong file_id - call list_user_files again and try a different file_id
+6. NEVER use placeholder file_ids - always use real file_ids from list_user_files results
+7. For time series questions requesting charts, ensure the response includes chart_config with chart_type, data, and options
 
 TOOL SELECTION GUIDE - CHOOSE THE RIGHT TOOL BASED ON QUESTION TYPE:
 
@@ -450,7 +627,7 @@ Thought: {{agent_scratchpad}}""")
         max_iterations=max_iterations,
         handle_parsing_errors="Check your output and make sure it conforms to the format instructions. If you see an error, retry with the correct format.",
         return_intermediate_steps=True,
-        max_execution_time=120  # 2 minutes max execution time
+        max_execution_time=300  # 5 minutes max execution time
     )
     
     return executor
@@ -507,7 +684,7 @@ async def execute_agent_query(
     user_id: str,
     file_id: Optional[str] = None,
     provider: str = "gemini",
-    max_iterations: int = 15,
+    max_iterations: int = 25,
     conversation_id: Optional[str] = None,
     date_range: Optional[Dict[str, Optional[str]]] = None
 ) -> Dict[str, Any]:
@@ -601,12 +778,61 @@ IMPORTANT: You don't have a specific file_id. You MUST:
         # Create agent executor
         executor = create_agent_executor(llm, user_id, file_id, max_iterations)
         
-        # Execute query
-        result = executor.invoke({"input": enhanced_question})
+        # Execute query with timeout and iteration limit handling
+        try:
+            result = executor.invoke({"input": enhanced_question})
+        except Exception as e:
+            error_msg = str(e).lower()
+            logger.error(f"Agent execution error: {str(e)}")
+            
+            # Check if it's an iteration limit error
+            if "iteration" in error_msg or "max_iterations" in error_msg or "maximum iterations" in error_msg:
+                logger.warning(f"Agent stopped due to iteration limit ({max_iterations}). Question: {question[:100]}")
+                return {
+                    "request_id": request_id,
+                    "success": False,
+                    "answer_short": f"I need more iterations to complete this query. Please try breaking it into smaller questions or increase max_iterations parameter (current: {max_iterations}, max: 50).",
+                    "answer_detailed": f"The query exceeded the maximum iteration limit of {max_iterations}. This usually happens with complex queries that require many tool calls. Suggestions: 1) Break the question into smaller parts, 2) Increase max_iterations parameter (up to 50), 3) Make the question more specific.",
+                    "error": "iteration_limit_exceeded",
+                    "tools_called": [],
+                    "latency_ms": int((time.time() - start_time) * 1000),
+                    "timestamp": datetime.utcnow(),
+                    "confidence": 0.0,
+                    "requires_date_range": requires_date_range,
+                    "date_range_info": date_range_info,
+                    "conversation_id": conversation_id
+                }
+            # Check if it's a time limit error
+            elif "time" in error_msg or "timeout" in error_msg or "execution time" in error_msg:
+                logger.warning(f"Agent stopped due to time limit. Question: {question[:100]}")
+                return {
+                    "request_id": request_id,
+                    "success": False,
+                    "answer_short": f"Query took too long to execute (exceeded 5 minute limit). Please try a more specific question or break it into smaller parts.",
+                    "answer_detailed": "The query exceeded the maximum execution time of 5 minutes. This usually happens with very complex queries or when processing large datasets. Suggestions: 1) Make the question more specific, 2) Filter data by date range or other criteria, 3) Break the question into smaller parts.",
+                    "error": "time_limit_exceeded",
+                    "tools_called": [],
+                    "latency_ms": int((time.time() - start_time) * 1000),
+                    "timestamp": datetime.utcnow(),
+                    "confidence": 0.0,
+                    "requires_date_range": requires_date_range,
+                    "date_range_info": date_range_info,
+                    "conversation_id": conversation_id
+                }
+            # Other errors
+            else:
+                raise
         
         # Extract information
         answer = result.get("output", "")
         intermediate_steps = result.get("intermediate_steps", [])
+        
+        # Track iteration count and warn if approaching limit
+        iteration_count = len(intermediate_steps)
+        if iteration_count >= max_iterations * 0.8:  # 80% of limit
+            logger.warning(f"Agent used {iteration_count}/{max_iterations} iterations ({iteration_count/max_iterations*100:.1f}%) for question: {question[:100]}")
+        elif iteration_count >= max_iterations * 0.6:  # 60% of limit
+            logger.info(f"Agent used {iteration_count}/{max_iterations} iterations ({iteration_count/max_iterations*100:.1f}%) for question: {question[:100]}")
         
         # Extract tools called
         tools_called = []

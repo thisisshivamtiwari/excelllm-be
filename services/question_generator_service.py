@@ -85,6 +85,7 @@ class MongoDBQuestionGenerator:
             
             metadata = file_info.get("metadata", {})
             file_type = file_info.get("file_type", "csv")
+            file_name = file_info.get("original_filename", "Unknown")
             sheets = metadata.get("sheets", {})
             
             normalized_count = 0
@@ -92,30 +93,58 @@ class MongoDBQuestionGenerator:
             # Process each sheet
             if file_type.lower() in ['xlsx', 'xls']:
                 excel_file = pd.ExcelFile(io.BytesIO(file_content))
+                logger.info(f"Excel file has {len(excel_file.sheet_names)} sheets: {excel_file.sheet_names}")
+                
                 for sheet_name in excel_file.sheet_names:
                     df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                    count = await self._normalize_dataframe(df, file_id, sheet_name)
+                    logger.info(f"Sheet '{sheet_name}': {len(df)} rows, {len(df.columns)} columns")
+                    
+                    if df.empty:
+                        logger.warning(f"Sheet '{sheet_name}' is empty - skipping")
+                        continue
+                    
+                    count = await self._normalize_dataframe(df, file_id, sheet_name, file_name)
+                    logger.info(f"Normalized {count} rows from sheet '{sheet_name}'")
                     normalized_count += count
                 excel_file.close()
             else:
                 # CSV file
                 encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
                 df = None
+                encoding_used = None
+                
                 for enc in encodings:
                     try:
                         df = pd.read_csv(io.BytesIO(file_content), encoding=enc)
+                        encoding_used = enc
+                        logger.info(f"CSV file read successfully with encoding '{enc}': {len(df)} rows, {len(df.columns)} columns")
                         break
                     except UnicodeDecodeError:
                         continue
+                    except Exception as e:
+                        logger.error(f"Error reading CSV with encoding '{enc}': {str(e)}")
+                        continue
                 
                 if df is not None:
-                    sheet_name = "Sheet1"
-                    normalized_count = await self._normalize_dataframe(df, file_id, sheet_name)
+                    if df.empty:
+                        logger.warning(f"CSV file {file_id} is empty - no rows to normalize")
+                    else:
+                        sheet_name = "Sheet1"
+                        count = await self._normalize_dataframe(df, file_id, sheet_name, file_name)
+                        logger.info(f"Normalized {count} rows from CSV file")
+                        normalized_count = count
+                else:
+                    logger.error(f"Could not read CSV file {file_id} with any encoding")
+                    return {
+                        "success": False,
+                        "error": "Could not read CSV file - encoding issues or file format error"
+                    }
             
             return {
                 "success": True,
                 "file_id": file_id,
-                "normalized_rows": normalized_count
+                "normalized_rows": normalized_count,
+                "normalized_count": normalized_count  # Add for API compatibility
             }
         except Exception as e:
             logger.error(f"Error normalizing file {file_id}: {str(e)}")
@@ -123,25 +152,58 @@ class MongoDBQuestionGenerator:
             logger.error(traceback.format_exc())
             return {"success": False, "error": str(e)}
     
-    async def _normalize_dataframe(self, df: pd.DataFrame, file_id: str, table_name: str) -> int:
-        """Normalize DataFrame rows into MongoDB tables collection"""
+    async def _normalize_dataframe(self, df: pd.DataFrame, file_id: str, table_name: str, file_name: Optional[str] = None) -> int:
+        """Normalize DataFrame rows into MongoDB tables collection
+        
+        Args:
+            df: DataFrame to normalize
+            file_id: File ID
+            table_name: Table/sheet name
+            file_name: Original filename (optional, will be fetched if not provided)
+        """
+        
+        # Validate DataFrame
+        if df is None:
+            logger.error(f"DataFrame is None for file {file_id}, table {table_name}")
+            return 0
+        
+        if df.empty:
+            logger.warning(f"DataFrame is empty for file {file_id}, table {table_name}")
+            return 0
+        
+        # Get file_name if not provided
+        if not file_name:
+            try:
+                file_info = await get_file_metadata(file_id, self.user)
+                file_name = file_info.get("original_filename", "Unknown") if file_info else "Unknown"
+            except Exception as e:
+                logger.warning(f"Could not fetch file_name for {file_id}: {str(e)}")
+                file_name = "Unknown"
+        
+        logger.info(f"Normalizing DataFrame: {len(df)} rows, {len(df.columns)} columns (File: {file_name}, Sheet: {table_name})")
+        
         # Delete existing rows for this file/table combination
-        await self.tables_collection.delete_many({
+        deleted_count = await self.tables_collection.delete_many({
             "file_id": file_id,
             "table_name": table_name,
             "user_id": self.user.id
         })
+        if deleted_count.deleted_count > 0:
+            logger.info(f"Deleted {deleted_count.deleted_count} existing normalized rows")
         
         # Convert DataFrame to dict records
         df = df.replace({np.nan: None, np.inf: None, -np.inf: None})
         records = df.to_dict('records')
         
-        # Insert normalized rows
+        logger.info(f"Converted to {len(records)} records")
+        
+        # Insert normalized rows with file_name included
         documents = []
         for idx, row in enumerate(records):
             doc = {
                 "user_id": self.user.id,
                 "file_id": file_id,
+                "file_name": file_name,  # ADD: Include file_name for faster access
                 "table_name": table_name,
                 "row_id": idx + 1,
                 "row": row,
@@ -151,6 +213,9 @@ class MongoDBQuestionGenerator:
         
         if documents:
             await self.tables_collection.insert_many(documents)
+            logger.info(f"Inserted {len(documents)} documents into MongoDB tables collection (File: {file_name}, Sheet: {table_name})")
+        else:
+            logger.warning(f"No documents to insert for file {file_id}, table {table_name}")
         
         return len(documents)
     

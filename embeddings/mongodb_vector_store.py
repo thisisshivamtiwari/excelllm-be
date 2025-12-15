@@ -80,8 +80,9 @@ class MongoDBVectorStore:
         """
         doc_id = f"{file_id}::{sheet_name}::{column_name}"
         
-        # Create document text for search
-        doc_text = f"Column: {column_name}"
+        # Create document text for search with file/sheet context
+        # Include file_name and sheet_name for better semantic search and context
+        doc_text = f"File: {file_name}, Sheet: {sheet_name}, Column: {column_name}"
         description = metadata.get("description", "")
         user_definition = metadata.get("user_definition", "")
         
@@ -89,6 +90,11 @@ class MongoDBVectorStore:
             doc_text += f" - {description}"
         elif user_definition:
             doc_text += f" - {user_definition}"
+        
+        # Add column type for additional context
+        column_type = metadata.get("column_type", "unknown")
+        if column_type and column_type != "unknown":
+            doc_text += f" (Type: {column_type})"
         
         # Prepare document
         doc = {
@@ -148,10 +154,30 @@ class MongoDBVectorStore:
         source_col = relationship.get("source_column", relationship.get("column", ""))
         target_col = relationship.get("target_column", "")
         
+        # Extract file/sheet context from column names if available
+        # Format: "file_name::sheet_name::column_name" or just "column_name"
+        source_file = relationship.get("file_name", "")
+        source_sheet = relationship.get("sheet", relationship.get("sheet_name", ""))
+        target_file = relationship.get("target_file_name", "")
+        target_sheet = relationship.get("target_sheet", relationship.get("target_sheet_name", ""))
+        
         doc_id = f"relationship::{rel_type}::{source_col}::{target_col}"
         
-        # Create document text
+        # Create document text with file/sheet context
         doc_text = f"Relationship: {rel_type}"
+        
+        # Add source context
+        if source_file and source_sheet:
+            doc_text += f" from File: {source_file}, Sheet: {source_sheet}"
+        elif source_sheet:
+            doc_text += f" from Sheet: {source_sheet}"
+        
+        # Add target context
+        if target_file and target_sheet:
+            doc_text += f" to File: {target_file}, Sheet: {target_sheet}"
+        elif target_sheet:
+            doc_text += f" to Sheet: {target_sheet}"
+        
         if relationship.get("description"):
             doc_text += f" - {relationship['description']}"
         

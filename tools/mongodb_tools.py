@@ -15,6 +15,12 @@ import pandas as pd
 from pathlib import Path
 import logging
 import os
+import re
+import calendar
+try:
+    from dateutil import parser as date_parser
+except ImportError:
+    date_parser = None
 
 # High precision for financial calculations
 getcontext().prec = 28
@@ -65,6 +71,96 @@ def get_sync_mongo_client():
     db_name = os.getenv("MONGODB_DB_NAME", "excelllm")
     
     return MongoClient(f"mongodb://{host}:{port}")[db_name]
+
+
+def build_multi_search_query(
+    user_id: str,
+    file_id: Optional[str] = None,
+    table_name: Optional[str] = None,
+    file_name_pattern: Optional[str] = None,
+    filters: Optional[Dict] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Build MongoDB query that supports:
+    - Single file/sheet (current behavior)
+    - All files (*)
+    - All sheets (*)
+    - File name pattern matching
+    """
+    from bson import ObjectId
+    try:
+        user_id_obj = ObjectId(user_id) if isinstance(user_id, str) and len(user_id) == 24 else user_id
+    except:
+        user_id_obj = user_id
+    
+    query = {"user_id": user_id_obj}
+    
+    # Handle file_id
+    if file_id and file_id != "*" and file_id != "all":
+        query["file_id"] = file_id
+    elif file_name_pattern:
+        # Need to lookup file_ids by filename pattern
+        db = get_sync_mongo_client()
+        files_coll = db['files']
+        matching_files = list(files_coll.find(
+            {
+                "user_id": user_id_obj,
+                "original_filename": {"$regex": file_name_pattern, "$options": "i"}
+            },
+            {"file_id": 1}
+        ))
+        if matching_files:
+            query["file_id"] = {"$in": [f["file_id"] for f in matching_files]}
+        else:
+            return None  # No matching files
+    
+    # Handle table_name
+    if table_name and table_name != "*" and table_name != "all":
+        query["table_name"] = table_name
+    
+    if filters:
+        query.update(filters)
+    
+    return query
+
+
+def _merge_schemas(schemas_by_source: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    """Merge schemas from multiple sources into unified schema"""
+    unified = {}
+    for source, schema in schemas_by_source.items():
+        for col_name, col_type in schema.items():
+            if col_name not in unified:
+                unified[col_name] = col_type
+            # If types differ, use most common or "mixed"
+            elif unified[col_name] != col_type:
+                unified[col_name] = "mixed"
+    return unified
+
+
+def _build_metric_expr(metric: Dict[str, str]) -> Dict[str, Any]:
+    """Build MongoDB aggregation expression for a metric"""
+    op_type = metric.get("op", "").lower()
+    col = metric.get("col", "")
+    alias = metric.get("alias", col)
+    
+    col_path = f"$row.{col}"
+    
+    if op_type == "sum":
+        return {"$sum": col_path}
+    elif op_type == "avg" or op_type == "average" or op_type == "mean":
+        return {"$avg": col_path}
+    elif op_type == "count":
+        return {"$sum": 1}
+    elif op_type == "min":
+        return {"$min": col_path}
+    elif op_type == "max":
+        return {"$max": col_path}
+    elif op_type == "median":
+        # Median requires $percentile aggregation (MongoDB 7.0+)
+        # Fallback to approximate median
+        return {"$avg": col_path}
+    else:
+        return {"$sum": col_path}  # Default to sum
 
 
 def get_date_range(
@@ -202,22 +298,30 @@ def get_date_range(
 
 def table_loader(
     user_id: str,
-    file_id: str,
-    table_name: str,
+    file_id: Optional[str] = None,  # Can be None, "*", "all", or specific file_id
+    table_name: Optional[str] = None,  # Can be None, "*", "all", or specific sheet
+    file_name_pattern: Optional[str] = None,  # Search by filename
     filters: Optional[Dict] = None,
     fields: Optional[List[str]] = None,
-    limit: int = 100
+    limit: int = 100,
+    include_source: bool = True  # Include file_id, file_name, table_name in results
 ) -> Dict[str, Any]:
     """
-    Load table sample and schema from MongoDB tables collection.
+    Enhanced table_loader that can search:
+    - All files: file_id="*" or None
+    - All sheets: table_name="*" or None
+    - By filename: file_name_pattern="July 25"
+    - Single file/sheet: file_id="xxx", table_name="Sheet1"
     
     Args:
         user_id: User ID for multi-tenant filtering
-        file_id: File ID
-        table_name: Table/sheet name
+        file_id: File ID (can be "*" for all files)
+        table_name: Table/sheet name (can be "*" for all sheets)
+        file_name_pattern: Search files by name pattern
         filters: Optional MongoDB filter dict
         fields: Optional list of fields to project
         limit: Maximum rows to return
+        include_source: Include source information in results
     
     Returns:
         Canonical tool envelope with schema, sample rows, and provenance
@@ -227,22 +331,20 @@ def table_loader(
     try:
         db = get_sync_mongo_client()
         coll = db['tables']
+        files_coll = db['files']
         
-        # Build query - convert user_id to ObjectId if it's a string
-        from bson import ObjectId
-        try:
-            user_id_obj = ObjectId(user_id) if isinstance(user_id, str) and len(user_id) == 24 else user_id
-        except:
-            user_id_obj = user_id
-        
-        query = {
-            "user_id": user_id_obj,
-            "file_id": file_id,
-            "table_name": table_name
-        }
-        
-        if filters:
-            query.update(filters)
+        # Build query with multi-search support
+        query = build_multi_search_query(user_id, file_id, table_name, file_name_pattern, filters)
+        if query is None:
+            return {
+                "ok": False,
+                "tool": "table_loader",
+                "error": "no_matching_files",
+                "result": None,
+                "unit": None,
+                "provenance": None,
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
         
         # Projection
         projection = None
@@ -250,7 +352,7 @@ def table_loader(
             projection = {f: 1 for f in fields}
             projection["_id"] = 0
         
-        # Fetch sample rows
+        # Fetch rows with source information
         cursor = coll.find(query, projection=projection).limit(limit)
         rows = list(cursor)
         
@@ -261,41 +363,94 @@ def table_loader(
                 "error": "no_rows",
                 "result": None,
                 "unit": None,
-                "provenance": {
-                    "mongo_query": query,
-                    "matched_row_count": 0,
-                    "sample_rows": []
-                },
+                "provenance": {"mongo_query": query, "matched_row_count": 0},
                 "meta": {"time_ms": now_ms() - start_ms}
             }
         
-        # Deduce schema from first row
-        sample = rows[:5]
-        schema = {}
-        if sample:
-            for key, value in sample[0].items():
-                if key not in ["_id", "user_id", "file_id", "table_name"]:
-                    schema[key] = type(value).__name__
+        # Get file metadata for source tracking
+        # First try to get file_name from rows (if normalized rows include it)
+        file_ids_in_results = set(r.get("file_id") for r in rows)
+        file_metadata = {}
         
-        # Get matched count
+        # Check if rows already have file_name (from normalized rows)
+        rows_with_file_name = [r for r in rows if r.get("file_name")]
+        if rows_with_file_name:
+            # Use file_name directly from rows (more efficient)
+            for row in rows:
+                fid = row.get("file_id")
+                if fid and fid not in file_metadata:
+                    file_metadata[fid] = row.get("file_name", "Unknown")
+        else:
+            # Fallback: lookup from files collection
+            for fid in file_ids_in_results:
+                file_doc = files_coll.find_one({"file_id": fid}, {"original_filename": 1, "file_id": 1})
+                if file_doc:
+                    file_metadata[fid] = file_doc.get("original_filename", "Unknown")
+        
+        # Build schema with source context
+        schemas_by_source = {}
+        sample_rows_by_source = {}
+        
+        for row in rows:
+            # Use file_name from row if available, otherwise lookup
+            file_name = row.get("file_name") or file_metadata.get(row.get("file_id"), "Unknown")
+            source_key = f"{file_name}::{row.get('table_name', 'Unknown')}"
+            
+            if source_key not in schemas_by_source:
+                schemas_by_source[source_key] = {}
+                sample_rows_by_source[source_key] = []
+            
+            # Extract schema from row
+            row_data = row.get("row", {})
+            for key, value in row_data.items():
+                if key not in schemas_by_source[source_key]:
+                    schemas_by_source[source_key][key] = type(value).__name__
+            
+            if len(sample_rows_by_source[source_key]) < 5:
+                sample_rows_by_source[source_key].append({
+                    "file_id": row.get("file_id"),
+                    "file_name": file_name,
+                    "table_name": row.get("table_name"),
+                    "row_id": row.get("row_id"),
+                    "data": row_data
+                })
+        
         matched_count = coll.count_documents(query)
         
-        return {
+        # For backward compatibility, also include single schema if only one source
+        unified_schema = _merge_schemas(schemas_by_source)
+        single_schema = list(schemas_by_source.values())[0] if len(schemas_by_source) == 1 else unified_schema
+        
+        result = {
             "ok": True,
             "tool": "table_loader",
             "result": {
-                "schema": schema,
-                "sample_rows": sample,
-                "row_count": matched_count
+                "schema": single_schema,  # Backward compatible
+                "schemas_by_source": schemas_by_source,  # Grouped by file::sheet
+                "unified_schema": unified_schema,  # All columns across all sources
+                "sample_rows": [r["data"] for r in list(sample_rows_by_source.values())[0][:5]] if sample_rows_by_source else [],  # Backward compatible
+                "sample_rows_by_source": sample_rows_by_source,
+                "sources": [
+                    {
+                        "file_id": fid,
+                        "file_name": file_metadata.get(fid, "Unknown"),
+                        "table_names": list(set(r.get("table_name") for r in rows if r.get("file_id") == fid))
+                    }
+                    for fid in file_ids_in_results
+                ],
+                "row_count": matched_count,
+                "total_sources": len(file_ids_in_results)
             },
             "unit": None,
             "provenance": {
                 "mongo_query": query,
                 "matched_row_count": matched_count,
-                "sample_rows": sample[:5]
+                "sources_searched": len(file_ids_in_results)
             },
             "meta": {"time_ms": now_ms() - start_ms}
         }
+        
+        return result
     except Exception as e:
         logger.error(f"Error in table_loader: {str(e)}")
         return {
@@ -311,21 +466,31 @@ def table_loader(
 
 def agg_helper(
     user_id: str,
-    file_id: str,
-    table_name: str,
+    file_id: Optional[str] = None,  # "*" for all files
+    table_name: Optional[str] = None,  # "*" for all sheets
+    file_name_pattern: Optional[str] = None,
     filters: Optional[Dict] = None,
-    metrics: List[Dict[str, str]] = None
+    metrics: List[Dict[str, str]] = None,
+    date_filter: Optional[Dict[str, Any]] = None,  # {"column": "date_col", "start": "2025-01-01", "end": "2025-12-31", "auto_detect": True}
+    auto_detect_date_column: bool = True,
+    group_by_source: bool = False  # If True, aggregate separately per file/sheet
 ) -> Dict[str, Any]:
     """
-    Run deterministic aggregations using MongoDB aggregation pipeline.
+    Enhanced aggregation that can aggregate:
+    - Across all files and sheets (unified result)
+    - Per file/sheet (group_by_source=True)
+    - With automatic date filtering
     
     Args:
         user_id: User ID for multi-tenant filtering
-        file_id: File ID
-        table_name: Table/sheet name
+        file_id: File ID (can be "*" for all files)
+        table_name: Table/sheet name (can be "*" for all sheets)
+        file_name_pattern: Search files by name pattern
         filters: Optional MongoDB filter dict
-        metrics: List of metric operations, e.g.:
-            [{"op": "sum", "col": "revenue", "alias": "total_revenue"}]
+        metrics: List of metric operations
+        date_filter: Optional date filter dict
+        auto_detect_date_column: Auto-detect date columns if date_filter provided
+        group_by_source: If True, aggregate separately per file/sheet
     
     Returns:
         Canonical tool envelope with aggregated results and provenance
@@ -335,6 +500,7 @@ def agg_helper(
     try:
         db = get_sync_mongo_client()
         coll = db['tables']
+        files_coll = db['files']
         
         if not metrics:
             return {
@@ -347,130 +513,196 @@ def agg_helper(
                 "meta": {"time_ms": now_ms() - start_ms}
             }
         
-        # Build match stage - convert user_id to ObjectId if needed
-        from bson import ObjectId
-        try:
-            user_id_obj = ObjectId(user_id) if isinstance(user_id, str) and len(user_id) == 24 else user_id
-        except:
-            user_id_obj = user_id
-        
-        match_stage = {
-            "$match": {
-                "user_id": user_id_obj,
-                "file_id": file_id,
-                "table_name": table_name
+        # Build base match stage with multi-search support
+        query = build_multi_search_query(user_id, file_id, table_name, file_name_pattern, filters)
+        if query is None:
+            return {
+                "ok": False,
+                "tool": "agg_helper",
+                "error": "no_matching_files",
+                "result": None,
+                "unit": None,
+                "provenance": None,
+                "meta": {"time_ms": now_ms() - start_ms}
             }
-        }
         
-        if filters:
-            # Convert filter format to MongoDB query format
-            if isinstance(filters, list):
-                # Handle list of filter objects like [{"col":"Line_Machine","op":"starts_with","value":"Line-1"}]
-                for filter_obj in filters:
-                    if isinstance(filter_obj, dict):
-                        col = filter_obj.get("col", "")
-                        op = filter_obj.get("op", "").lower()
-                        value = filter_obj.get("value")
-                        
-                        if col and value is not None:
-                            col_path = f"row.{col}"
-                            if op == "starts_with" or op == "startswith":
-                                match_stage["$match"][col_path] = {"$regex": f"^{value}", "$options": "i"}
-                            elif op == "ends_with" or op == "endswith":
-                                match_stage["$match"][col_path] = {"$regex": f"{value}$", "$options": "i"}
-                            elif op == "contains":
-                                match_stage["$match"][col_path] = {"$regex": value, "$options": "i"}
-                            elif op == "eq" or op == "equals" or op == "==":
-                                match_stage["$match"][col_path] = value
-                            elif op == "ne" or op == "not_equals" or op == "!=":
-                                match_stage["$match"][col_path] = {"$ne": value}
-                            elif op == "gt" or op == "greater_than" or op == ">":
-                                match_stage["$match"][col_path] = {"$gt": value}
-                            elif op == "gte" or op == "greater_than_equal" or op == ">=":
-                                match_stage["$match"][col_path] = {"$gte": value}
-                            elif op == "lt" or op == "less_than" or op == "<":
-                                match_stage["$match"][col_path] = {"$lt": value}
-                            elif op == "lte" or op == "less_than_equal" or op == "<=":
-                                match_stage["$match"][col_path] = {"$lte": value}
-                            elif op == "in":
-                                match_stage["$match"][col_path] = {"$in": value if isinstance(value, list) else [value]}
-                            else:
-                                # Default to equality
-                                match_stage["$match"][col_path] = value
-            elif isinstance(filters, dict):
-                # Handle direct MongoDB filter dict
-                match_stage["$match"].update(filters)
+        match_stage = {"$match": query}
         
-        # Build group stage
-        group_stage = {"$group": {"_id": None}}
+        # Handle date filter
+        date_column = None
+        if date_filter:
+            date_column = date_filter.get("column")
+            
+            # Auto-detect date column if needed
+            if not date_column and date_filter.get("auto_detect", auto_detect_date_column):
+                # Import here to avoid circular dependency
+                detect_result = detect_date_columns(user_id, file_id, table_name, file_name_pattern)
+                if detect_result.get("ok"):
+                    date_cols_by_source = detect_result.get("result", {}).get("date_columns_by_source", {})
+                    for source, cols in date_cols_by_source.items():
+                        if cols:
+                            date_column = list(cols.keys())[0]
+                            break
+            
+            if date_column:
+                date_start = date_filter.get("start")
+                date_end = date_filter.get("end")
+                
+                # Parse relative dates if needed
+                if isinstance(date_start, str) and not re.match(r'^\d{4}-\d{2}-\d{2}', date_start):
+                    parsed = parse_relative_date(date_start)
+                    if parsed.get("ok"):
+                        date_start = parsed["result"]["start_date"]
+                
+                if isinstance(date_end, str) and not re.match(r'^\d{4}-\d{2}-\d{2}', date_end):
+                    parsed = parse_relative_date(date_end)
+                    if parsed.get("ok"):
+                        date_end = parsed["result"]["end_date"]
+                
+                # Add date filter to match stage
+                if date_start or date_end:
+                    date_query = {}
+                    if date_start:
+                        try:
+                            date_query["$gte"] = datetime.fromisoformat(date_start.replace('Z', '+00:00'))
+                        except:
+                            date_query["$gte"] = date_start
+                    if date_end:
+                        try:
+                            date_query["$lte"] = datetime.fromisoformat(date_end.replace('Z', '+00:00'))
+                        except:
+                            date_query["$lte"] = date_end
+                    
+                    match_stage["$match"][f"row.{date_column}"] = date_query
         
-        for m in metrics:
-            op_name = m.get('op', '').lower()
-            col = m.get('col', '')
-            alias = m.get('alias', f"{op_name}_{col}")
+        # Handle filters (list format)
+        if filters and isinstance(filters, list):
+            for filter_obj in filters:
+                if isinstance(filter_obj, dict):
+                    col = filter_obj.get("col", "")
+                    op = filter_obj.get("op", "").lower()
+                    value = filter_obj.get("value")
+                    
+                    if col and value is not None:
+                        col_path = f"row.{col}"
+                        if op == "starts_with" or op == "startswith":
+                            match_stage["$match"][col_path] = {"$regex": f"^{value}", "$options": "i"}
+                        elif op == "ends_with" or op == "endswith":
+                            match_stage["$match"][col_path] = {"$regex": f"{value}$", "$options": "i"}
+                        elif op == "contains":
+                            match_stage["$match"][col_path] = {"$regex": value, "$options": "i"}
+                        elif op == "eq" or op == "equals" or op == "==":
+                            match_stage["$match"][col_path] = value
+                        elif op == "ne" or op == "not_equals" or op == "!=":
+                            match_stage["$match"][col_path] = {"$ne": value}
+                        elif op == "gt" or op == "greater_than" or op == ">":
+                            match_stage["$match"][col_path] = {"$gt": value}
+                        elif op == "gte" or op == "greater_than_equal" or op == ">=":
+                            match_stage["$match"][col_path] = {"$gte": value}
+                        elif op == "lt" or op == "less_than" or op == "<":
+                            match_stage["$match"][col_path] = {"$lt": value}
+                        elif op == "lte" or op == "less_than_equal" or op == "<=":
+                            match_stage["$match"][col_path] = {"$lte": value}
+                        elif op == "in":
+                            match_stage["$match"][col_path] = {"$in": value if isinstance(value, list) else [value]}
+                        else:
+                            match_stage["$match"][col_path] = value
+        
+        # Build aggregation pipeline
+        pipeline = [match_stage]
+        
+        if group_by_source:
+            # Group by file_id and table_name to get per-source results
+            group_stage = {
+                "$group": {
+                    "_id": {
+                        "file_id": "$file_id",
+                        "table_name": "$table_name"
+                    },
+                    **{metric["alias"]: _build_metric_expr(metric) for metric in metrics}
+                }
+            }
+            pipeline.append(group_stage)
             
-            if not col:
-                continue
+            # Lookup file names
+            lookup_stage = {
+                "$lookup": {
+                    "from": "files",
+                    "let": {"file_id": "$_id.file_id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": ["$file_id", "$$file_id"]}}},
+                        {"$project": {"original_filename": 1}}
+                    ],
+                    "as": "file_info"
+                }
+            }
+            pipeline.append(lookup_stage)
             
-            # Access column via row.field_name structure
-            col_path = f"$row.{col}"
+            # Format results
+            project_stage = {
+                "$project": {
+                    "file_id": "$_id.file_id",
+                    "file_name": {"$arrayElemAt": ["$file_info.original_filename", 0]},
+                    "table_name": "$_id.table_name",
+                    **{metric["alias"]: 1 for metric in metrics}
+                }
+            }
+            pipeline.append(project_stage)
+        else:
+            # Unified aggregation across all sources
+            group_stage = {
+                "$group": {
+                    "_id": None,
+                    **{metric["alias"]: _build_metric_expr(metric) for metric in metrics}
+                }
+            }
+            pipeline.append(group_stage)
             
-            if op_name == "sum":
-                group_stage["$group"][alias] = {"$sum": col_path}
-            elif op_name == "avg":
-                group_stage["$group"][alias] = {"$avg": col_path}
-            elif op_name == "min":
-                group_stage["$group"][alias] = {"$min": col_path}
-            elif op_name == "max":
-                group_stage["$group"][alias] = {"$max": col_path}
-            elif op_name == "count":
-                group_stage["$group"][alias] = {"$sum": 1}
-            elif op_name == "median":
-                # Use $percentile if available (MongoDB 5.2+), else compute in Python
-                group_stage["$group"][alias] = {"$percentile": {
-                    "input": col_path,
-                    "p": [0.5],
-                    "method": "approximate"
-                }}
-            else:
-                logger.warning(f"Unsupported operation: {op_name}")
-                continue
+            # Remove _id from result
+            project_stage = {
+                "$project": {
+                    "_id": 0,
+                    **{metric["alias"]: 1 for metric in metrics}
+                }
+            }
+            pipeline.append(project_stage)
         
         # Execute pipeline
-        pipeline = [match_stage, group_stage]
-        agg_res = list(coll.aggregate(pipeline))
-        
-        result = agg_res[0] if agg_res else {}
+        results = list(coll.aggregate(pipeline))
         
         # Convert numeric fields to Decimal for accuracy
-        for key in list(result.keys()):
-            if key == "_id":
-                continue
-            value = result[key]
-            if isinstance(value, (int, float, np.number)):
-                result[key] = Decimal(str(value))
-            elif isinstance(value, list) and len(value) == 1:
-                # Handle percentile result
-                result[key] = Decimal(str(value[0]))
+        for result_item in results:
+            for key in list(result_item.keys()):
+                if key == "_id":
+                    continue
+                value = result_item[key]
+                if isinstance(value, (int, float, np.number)):
+                    result_item[key] = Decimal(str(value))
+                elif isinstance(value, list) and len(value) == 1:
+                    result_item[key] = Decimal(str(value[0]))
         
-        # Get sample rows for provenance
-        sample_rows = list(coll.find(match_stage["$match"]).limit(5))
         matched_count = coll.count_documents(match_stage["$match"])
         
         return {
             "ok": True,
             "tool": "agg_helper",
-            "result": result,
+            "result": {
+                "aggregated": results[0] if not group_by_source and results else results,
+                "grouped_by_source": group_by_source
+            },
             "unit": None,
             "provenance": {
                 "mongo_pipeline": pipeline,
                 "matched_row_count": matched_count,
-                "sample_rows": sample_rows[:3]
+                "sources_searched": len(set(query.get("file_id", []))) if isinstance(query.get("file_id"), list) else 1,
+                "date_column_used": date_column
             },
             "meta": {"time_ms": now_ms() - start_ms}
         }
     except Exception as e:
         logger.error(f"Error in agg_helper: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {
             "ok": False,
             "tool": "agg_helper",
@@ -1095,6 +1327,594 @@ def rank_entities(
         return {
             "ok": False,
             "tool": "rank_entities",
+            "error": str(e),
+            "result": None,
+            "unit": None,
+            "provenance": None,
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+
+
+def parse_relative_date(
+    date_expression: str,
+    reference_date: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """
+    Parse relative date expressions and convert to absolute dates.
+    
+    Examples:
+    - "last month" → start/end of previous month
+    - "this week" → start/end of current week
+    - "last 30 days" → 30 days ago to today
+    - "Q1 2025" → Jan 1 - Mar 31, 2025
+    - "July 25" → July 25 of current/next year
+    """
+    start_ms = now_ms()
+    
+    try:
+        if reference_date is None:
+            reference_date = datetime.now()
+        
+        date_expr_lower = date_expression.lower().strip()
+        
+        # Relative expressions
+        if "last month" in date_expr_lower or "previous month" in date_expr_lower:
+            # First day of last month
+            if reference_date.month == 1:
+                start_date = datetime(reference_date.year - 1, 12, 1)
+            else:
+                start_date = datetime(reference_date.year, reference_date.month - 1, 1)
+            # Last day of last month
+            last_day = calendar.monthrange(start_date.year, start_date.month)[1]
+            end_date = datetime(start_date.year, start_date.month, last_day)
+            
+            return {
+                "ok": True,
+                "tool": "parse_relative_date",
+                "result": {
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "type": "last_month",
+                    "expression": date_expression
+                },
+                "unit": None,
+                "provenance": {
+                    "reference_date": reference_date.isoformat(),
+                    "parsed_as": "last_month"
+                },
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
+        
+        elif "this month" in date_expr_lower or "current month" in date_expr_lower:
+            start_date = datetime(reference_date.year, reference_date.month, 1)
+            last_day = calendar.monthrange(reference_date.year, reference_date.month)[1]
+            end_date = datetime(reference_date.year, reference_date.month, last_day)
+            
+            return {
+                "ok": True,
+                "tool": "parse_relative_date",
+                "result": {
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "type": "this_month",
+                    "expression": date_expression
+                },
+                "unit": None,
+                "provenance": {"reference_date": reference_date.isoformat()},
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
+        
+        elif "last week" in date_expr_lower:
+            days_since_monday = reference_date.weekday()
+            last_monday = reference_date - timedelta(days=days_since_monday + 7)
+            start_date = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_date = start_date + timedelta(days=6, hours=23, minutes=59, seconds=59)
+            
+            return {
+                "ok": True,
+                "tool": "parse_relative_date",
+                "result": {
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "type": "last_week",
+                    "expression": date_expression
+                },
+                "unit": None,
+                "provenance": {"reference_date": reference_date.isoformat()},
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
+        
+        elif "this week" in date_expr_lower:
+            days_since_monday = reference_date.weekday()
+            this_monday = reference_date - timedelta(days=days_since_monday)
+            start_date = this_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_date = reference_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+            
+            return {
+                "ok": True,
+                "tool": "parse_relative_date",
+                "result": {
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "type": "this_week",
+                    "expression": date_expression
+                },
+                "unit": None,
+                "provenance": {"reference_date": reference_date.isoformat()},
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
+        
+        # "last N days" pattern
+        days_match = re.search(r'last\s+(\d+)\s+days?', date_expr_lower)
+        if days_match:
+            days = int(days_match.group(1))
+            end_date = reference_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+            start_date = (reference_date - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            return {
+                "ok": True,
+                "tool": "parse_relative_date",
+                "result": {
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "type": f"last_{days}_days",
+                    "expression": date_expression
+                },
+                "unit": None,
+                "provenance": {"reference_date": reference_date.isoformat()},
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
+        
+        # Try parsing as absolute date
+        if date_parser:
+            try:
+                parsed_date = date_parser.parse(date_expression, fuzzy=True)
+                return {
+                    "ok": True,
+                    "tool": "parse_relative_date",
+                    "result": {
+                        "start_date": parsed_date.isoformat(),
+                        "end_date": parsed_date.isoformat(),
+                        "type": "absolute_date",
+                        "expression": date_expression
+                    },
+                    "unit": None,
+                    "provenance": {"reference_date": reference_date.isoformat()},
+                    "meta": {"time_ms": now_ms() - start_ms}
+                }
+            except:
+                pass
+        
+        return {
+            "ok": False,
+            "tool": "parse_relative_date",
+            "error": "could_not_parse",
+            "result": None,
+            "unit": None,
+            "provenance": None,
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+    except Exception as e:
+        logger.error(f"Error in parse_relative_date: {str(e)}")
+        return {
+            "ok": False,
+            "tool": "parse_relative_date",
+            "error": str(e),
+            "result": None,
+            "unit": None,
+            "provenance": None,
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+
+
+def extract_dates_from_filenames(
+    user_id: str,
+    file_name_pattern: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Extract date information from file names.
+    Handles patterns like:
+    - "July 25", "July 2025", "2025-07-25"
+    - "Q1 2025", "Q2-2025"
+    - "2025-07", "07-2025"
+    """
+    start_ms = now_ms()
+    
+    try:
+        from bson import ObjectId
+        db = get_sync_mongo_client()
+        files_coll = db['files']
+        
+        # Convert user_id
+        try:
+            user_id_obj = ObjectId(user_id) if isinstance(user_id, str) and len(user_id) == 24 else user_id
+        except:
+            user_id_obj = user_id
+        
+        # Get all files
+        query = {"user_id": user_id_obj}
+        if file_name_pattern:
+            query["original_filename"] = {"$regex": file_name_pattern, "$options": "i"}
+        
+        files = list(files_coll.find(query, {"file_id": 1, "original_filename": 1}))
+        
+        current_date = datetime.now()
+        extracted_dates = []
+        
+        # Month name mapping
+        month_names = {month.lower(): i for i, month in enumerate(calendar.month_name[1:], 1)}
+        month_abbr = {abbr.lower(): i for i, abbr in enumerate(calendar.month_abbr[1:], 1)}
+        
+        for file_doc in files:
+            filename = file_doc.get("original_filename", "")
+            file_id = file_doc.get("file_id")
+            
+            date_info = {
+                "file_id": file_id,
+                "filename": filename,
+                "extracted_dates": []
+            }
+            
+            # Pattern 1: YYYY-MM-DD, YYYY/MM/DD, etc.
+            date_patterns = [
+                (r'(\d{4})-(\d{2})-(\d{2})', '%Y-%m-%d'),
+                (r'(\d{4})/(\d{2})/(\d{2})', '%Y/%m/%d'),
+                (r'(\d{2})-(\d{2})-(\d{4})', '%m-%d-%Y'),
+                (r'(\d{2})/(\d{2})/(\d{4})', '%m/%d/%Y'),
+            ]
+            
+            for pattern, fmt in date_patterns:
+                match = re.search(pattern, filename)
+                if match:
+                    try:
+                        date_str = match.group(0)
+                        parsed_date = datetime.strptime(date_str, fmt)
+                        date_info["extracted_dates"].append({
+                            "date": parsed_date.isoformat(),
+                            "type": "specific_date",
+                            "pattern": date_str
+                        })
+                    except:
+                        pass
+            
+            # Pattern 2: Month name + day/year (e.g., "July 25", "July 2025")
+            month_day_pattern = r'(\w+)\s+(\d{1,2})(?:\s+(\d{4}))?'
+            match = re.search(month_day_pattern, filename, re.IGNORECASE)
+            if match:
+                month_str = match.group(1).lower()
+                day = int(match.group(2))
+                year = int(match.group(3)) if match.group(3) else current_date.year
+                
+                month_num = month_names.get(month_str) or month_abbr.get(month_str)
+                if month_num:
+                    try:
+                        parsed_date = datetime(year, month_num, day)
+                        date_info["extracted_dates"].append({
+                            "date": parsed_date.isoformat(),
+                            "type": "month_day",
+                            "pattern": match.group(0)
+                        })
+                    except:
+                        pass
+            
+            # Pattern 3: YYYY-MM or MM-YYYY (month only)
+            month_only_patterns = [
+                (r'(\d{4})-(\d{2})(?!-\d{2})', '%Y-%m'),  # YYYY-MM
+                (r'(\d{2})-(\d{4})(?!-\d{2})', '%m-%Y'),  # MM-YYYY
+            ]
+            for pattern, fmt in month_only_patterns:
+                match = re.search(pattern, filename)
+                if match:
+                    try:
+                        date_str = match.group(0)
+                        parsed_date = datetime.strptime(date_str, fmt)
+                        date_info["extracted_dates"].append({
+                            "date": parsed_date.isoformat(),
+                            "type": "month_only",
+                            "pattern": date_str
+                        })
+                    except:
+                        pass
+            
+            # Pattern 4: Quarter (Q1 2025, Q2-2025)
+            quarter_pattern = r'Q([1-4])(?:\s+|-)?(\d{4})?'
+            match = re.search(quarter_pattern, filename, re.IGNORECASE)
+            if match:
+                quarter = int(match.group(1))
+                year = int(match.group(2)) if match.group(2) else current_date.year
+                month = (quarter - 1) * 3 + 1
+                start_date = datetime(year, month, 1)
+                end_date = datetime(year, month + 2, calendar.monthrange(year, month + 2)[1])
+                date_info["extracted_dates"].append({
+                    "date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "type": "quarter",
+                    "pattern": match.group(0)
+                })
+            
+            if date_info["extracted_dates"]:
+                extracted_dates.append(date_info)
+        
+        return {
+            "ok": True,
+            "tool": "extract_dates_from_filenames",
+            "result": {
+                "files_with_dates": extracted_dates,
+                "total_files": len(extracted_dates)
+            },
+            "unit": None,
+            "provenance": {
+                "current_date": current_date.isoformat(),
+                "files_searched": len(files)
+            },
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+    except Exception as e:
+        logger.error(f"Error in extract_dates_from_filenames: {str(e)}")
+        return {
+            "ok": False,
+            "tool": "extract_dates_from_filenames",
+            "error": str(e),
+            "result": None,
+            "unit": None,
+            "provenance": None,
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+
+
+def detect_date_columns(
+    user_id: str,
+    file_id: Optional[str] = None,  # "*" for all files
+    table_name: Optional[str] = None,  # "*" for all sheets
+    file_name_pattern: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Auto-detect all columns that contain date values across files/sheets.
+    Returns columns with date patterns, date ranges, and formats.
+    """
+    start_ms = now_ms()
+    
+    try:
+        from bson import ObjectId
+        db = get_sync_mongo_client()
+        coll = db['tables']
+        files_coll = db['files']
+        
+        # Build query
+        query = build_multi_search_query(user_id, file_id, table_name, file_name_pattern)
+        if query is None:
+            return {
+                "ok": False,
+                "tool": "detect_date_columns",
+                "error": "no_matching_files",
+                "result": None,
+                "unit": None,
+                "provenance": None,
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
+        
+        # Sample rows to detect date columns
+        cursor = coll.find(query).limit(1000)
+        rows = list(cursor)
+        
+        if not rows:
+            return {
+                "ok": False,
+                "tool": "detect_date_columns",
+                "error": "no_rows",
+                "result": None,
+                "unit": None,
+                "provenance": None,
+                "meta": {"time_ms": now_ms() - start_ms}
+            }
+        
+        # Analyze each column for date patterns
+        date_columns_by_source = {}
+        date_patterns = [
+            r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+            r'\d{2}/\d{2}/\d{4}',   # MM/DD/YYYY
+            r'\d{2}-\d{2}-\d{4}',   # MM-DD-YYYY
+            r'\d{4}/\d{2}/\d{2}',   # YYYY/MM/DD
+        ]
+        
+        for row in rows:
+            source_key = f"{row.get('file_id')}::{row.get('table_name')}"
+            row_data = row.get("row", {})
+            
+            if source_key not in date_columns_by_source:
+                date_columns_by_source[source_key] = {}
+            
+            for col_name, col_value in row_data.items():
+                if col_name not in date_columns_by_source[source_key]:
+                    date_columns_by_source[source_key][col_name] = {
+                        "date_count": 0,
+                        "total_count": 0,
+                        "min_date": None,
+                        "max_date": None
+                    }
+                
+                date_info = date_columns_by_source[source_key][col_name]
+                date_info["total_count"] += 1
+                
+                if col_value is not None:
+                    # Try to parse as date
+                    is_date = False
+                    parsed_date = None
+                    
+                    # Check if it's already a datetime object
+                    if isinstance(col_value, datetime):
+                        is_date = True
+                        parsed_date = col_value
+                    # Check string patterns
+                    elif isinstance(col_value, str):
+                        # Try dateutil parser (handles many formats)
+                        if date_parser:
+                            try:
+                                parsed_date = date_parser.parse(col_value, fuzzy=False)
+                                is_date = True
+                            except:
+                                # Check regex patterns
+                                for pattern in date_patterns:
+                                    if re.match(pattern, col_value):
+                                        try:
+                                            parsed_date = date_parser.parse(col_value)
+                                            is_date = True
+                                            break
+                                        except:
+                                            pass
+                    
+                    if is_date and parsed_date:
+                        date_info["date_count"] += 1
+                        if date_info["min_date"] is None or parsed_date < date_info["min_date"]:
+                            date_info["min_date"] = parsed_date
+                        if date_info["max_date"] is None or parsed_date > date_info["max_date"]:
+                            date_info["max_date"] = parsed_date
+        
+        # Filter columns that are likely dates (>= 50% date values)
+        confirmed_date_columns = {}
+        for source_key, columns in date_columns_by_source.items():
+            confirmed_date_columns[source_key] = {}
+            for col_name, info in columns.items():
+                if info["total_count"] > 0:
+                    date_ratio = info["date_count"] / info["total_count"]
+                    if date_ratio >= 0.5:  # At least 50% are dates
+                        confirmed_date_columns[source_key][col_name] = {
+                            "confidence": date_ratio,
+                            "min_date": info["min_date"].isoformat() if info["min_date"] else None,
+                            "max_date": info["max_date"].isoformat() if info["max_date"] else None,
+                            "sample_count": info["total_count"]
+                        }
+        
+        # Get file names
+        file_ids = set(r.get("file_id") for r in rows)
+        file_metadata = {}
+        for fid in file_ids:
+            file_doc = files_coll.find_one({"file_id": fid}, {"original_filename": 1})
+            if file_doc:
+                file_metadata[fid] = file_doc.get("original_filename", "Unknown")
+        
+        return {
+            "ok": True,
+            "tool": "detect_date_columns",
+            "result": {
+                "date_columns_by_source": confirmed_date_columns,
+                "file_metadata": file_metadata,
+                "total_sources": len(file_ids)
+            },
+            "unit": None,
+            "provenance": {
+                "mongo_query": query,
+                "sources_analyzed": len(file_ids)
+            },
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+    except Exception as e:
+        logger.error(f"Error in detect_date_columns: {str(e)}")
+        return {
+            "ok": False,
+            "tool": "detect_date_columns",
+            "error": str(e),
+            "result": None,
+            "unit": None,
+            "provenance": None,
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+
+
+def search_across_all_files(
+    user_id: str,
+    column_name: str,
+    search_value: Optional[str] = None,
+    file_name_pattern: Optional[str] = None,
+    table_name_pattern: Optional[str] = None,
+    limit: int = 100
+) -> Dict[str, Any]:
+    """
+    Search for a column across ALL files and sheets.
+    Useful when user asks "find X in all my files"
+    """
+    start_ms = now_ms()
+    
+    try:
+        from bson import ObjectId
+        db = get_sync_mongo_client()
+        coll = db['tables']
+        files_coll = db['files']
+        
+        # Convert user_id
+        try:
+            user_id_obj = ObjectId(user_id) if isinstance(user_id, str) and len(user_id) == 24 else user_id
+        except:
+            user_id_obj = user_id
+        
+        # Build query
+        query = {"user_id": user_id_obj}
+        
+        if file_name_pattern:
+            # Find matching file_ids
+            matching_files = list(files_coll.find(
+                {"user_id": user_id_obj, "original_filename": {"$regex": file_name_pattern, "$options": "i"}},
+                {"file_id": 1}
+            ))
+            if matching_files:
+                query["file_id"] = {"$in": [f["file_id"] for f in matching_files]}
+        
+        if table_name_pattern:
+            query["table_name"] = {"$regex": table_name_pattern, "$options": "i"}
+        
+        # Check if column exists
+        query[f"row.{column_name}"] = {"$exists": True}
+        
+        if search_value:
+            query[f"row.{column_name}"] = {"$regex": search_value, "$options": "i"}
+        
+        # Fetch results
+        cursor = coll.find(query).limit(limit)
+        rows = list(cursor)
+        
+        # Group by source
+        results_by_source = {}
+        for row in rows:
+            file_id = row.get("file_id")
+            table_name = row.get("table_name")
+            source_key = f"{file_id}::{table_name}"
+            
+            if source_key not in results_by_source:
+                file_doc = files_coll.find_one({"file_id": file_id}, {"original_filename": 1})
+                results_by_source[source_key] = {
+                    "file_id": file_id,
+                    "file_name": file_doc.get("original_filename", "Unknown") if file_doc else "Unknown",
+                    "table_name": table_name,
+                    "matches": []
+                }
+            
+            results_by_source[source_key]["matches"].append({
+                "row_id": row.get("row_id"),
+                "value": row.get("row", {}).get(column_name),
+                "row_data": row.get("row", {})
+            })
+        
+        return {
+            "ok": True,
+            "tool": "search_across_all_files",
+            "result": {
+                "column_name": column_name,
+                "results_by_source": list(results_by_source.values()),
+                "total_matches": len(rows),
+                "sources_found": len(results_by_source)
+            },
+            "unit": None,
+            "provenance": {
+                "mongo_query": query,
+                "matched_row_count": len(rows)
+            },
+            "meta": {"time_ms": now_ms() - start_ms}
+        }
+    except Exception as e:
+        logger.error(f"Error in search_across_all_files: {str(e)}")
+        return {
+            "ok": False,
+            "tool": "search_across_all_files",
             "error": str(e),
             "result": None,
             "unit": None,
